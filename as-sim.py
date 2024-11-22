@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) 2013 Daniel Williams.
 # 
@@ -139,14 +139,14 @@ class Sources(Process):
         if profile:
             for i in itertools.count():
                 yield hold, self, random.expovariate(Sources.profile_rate_modifier(now(), profile))
-                j = Job("Job%d" % i, service_time_distribution.next())
+                j = Job("Job%d" % i, next(service_time_distribution))
                 Server.queue.append(j)
                 if Server.idle:
                     reactivate(random.choice(Server.idle))
         else:
             for i in itertools.count():
                 yield hold, self, random.expovariate(Sources.sinusoidal_rate_modifier(arrival_rate, now(), period, amplitude, phase, offset))
-                j = Job("Job%d" % i, service_time_distribution.next())
+                j = Job("Job%d" % i, next(service_time_distribution))
                 Server.queue.append(j)
                 if Server.idle:
                     reactivate(random.choice(Server.idle))
@@ -167,7 +167,7 @@ class Server(Process):
 
     def __init__(self, max_wait, instance_type='m1.small', latency=0):
         self.terminated = False
-        name = 'Server%d' % Server.counter.next()
+        name = 'Server%d' % next(Server.counter)
         Process.__init__(self, name)
         self.max_wait = max_wait
         self.instance_type = instance_type
@@ -336,7 +336,7 @@ class Watcher(Process):
                 #
                 # compute the cpu utilization metric over the desired period
                 #
-                samples = self.period / sample_period
+                samples = int(self.period / sample_period)
                 utilization = sum(Watcher.cpu_utilization.yseries()[-samples:]) / samples
                 measures.append(utilization)
                 if len(measures) >= (self.breach_duration // self.period):
@@ -375,15 +375,15 @@ if __name__ == '__main__':
     # process command line arguments
     #
     parser = optparse.OptionParser(__doc__)
-    parser.add_option('', '--seed', dest='seed', action='store', type='int', default=0, help='PRNG seed (default: %default means use an OS source)')
-    parser.add_option('', '--capacity', dest='capacity', action='store', type='int', default=1, help='Set initial number of servers (default: %default)')
+    parser.add_option('', '--seed', dest='seed', action='store', type='int', default=0, help='PRNG seed (default: %(default) means use an OS source)')
+    parser.add_option('', '--capacity', dest='capacity', action='store', type='int', default=1, help='Set initial number of servers (default: %(default))')
     parser.add_option('', '--trace', dest='trace', action='store_true', help='Trace simulation activity (very detailed)')
     parser.add_option('', '--plot', dest='plot', action='store_true', help='Plot capacity and load vs. time')
-    parser.add_option('', '--duration', dest='duration', action='store', type='float', default=24*60*60, help='Duration of simulation (in seconds) (default: %default)')
-    parser.add_option('', '--max_wait', dest='max_wait', action='store', type='float', default=180, help='Maximum wait for completed service (in seconds) (default: %default)')
-    parser.add_option('', '--instance_type', dest='instance_type', action='store', type='choice', choices=COST_MODEL.keys(), default='m1.small', help='EC2 instance type [default: %default]')
-    parser.add_option('', '--latency', dest='latency', action='store', type='float', default=90, help='Time it takes for new servers to spin up (in seconds) (default: %default)')
-    parser.add_option('', '--rate', dest='rate', action='store', type='float', default=0.25, help='Arrival rate of jobs per second (default: %default)')
+    parser.add_option('', '--duration', dest='duration', action='store', type='float', default=24*60*60, help='Duration of simulation (in seconds) (default: %(default))')
+    parser.add_option('', '--max_wait', dest='max_wait', action='store', type='float', default=180, help='Maximum wait for completed service (in seconds) (default: %(default))')
+    parser.add_option('', '--instance_type', dest='instance_type', action='store', type='choice', choices=list(COST_MODEL.keys()), default='m1.small', help='EC2 instance type [default: %(default)]')
+    parser.add_option('', '--latency', dest='latency', action='store', type='float', default=90, help='Time it takes for new servers to spin up (in seconds) (default: %(default))')
+    parser.add_option('', '--rate', dest='rate', action='store', type='float', default=0.25, help='Arrival rate of jobs per second (default: %(default))')
 
     si_help = \
 '''You can modify the base rate of job arrivals as a function of
@@ -449,7 +449,7 @@ if __name__ == '__main__':
     try:
         with open(file, 'r') as _:
             pass
-    except Exception, e:
+    except Exception as e:
         parser.error(str(e))
 
     if options.as_period % 60 != 0:
@@ -470,7 +470,7 @@ if __name__ == '__main__':
                 assert isinstance(i[1], int) or isinstance(i[1], float), 'item second element is not numeric'
                 assert i[1] >= 0, 'item second element is less than zero'
             options.profile = profile
-        except Exception, e:
+        except Exception as e:
             parser.error('evaluation of profile failed: %s' % str(e))
 
     #
@@ -521,21 +521,20 @@ if __name__ == '__main__':
     Server.total()
     Server.total_capacity.observe(len(Server.busy) + len(Server.idle))
 
-    print
-    print "server utilization                      :%6.2f%%" % Watcher.cpu_utilization.timeAverage()
+    print("server utilization                      :%6.2f%%" % Watcher.cpu_utilization.timeAverage())
     count = 0
-    for i, y in itertools.izip(itertools.count(), sorted(Server.time_in_system.yseries())):
+    for i, y in zip(itertools.count(), sorted(Server.time_in_system.yseries())):
         count = i + 1
         if y > 30.0:
             break
-    print "percentage of requests served within 30s:%6.2f%%" % (count * 100.0 / (Server.jobs_timed_out + Server.jobs_processed))
-    print "percentage timed out (%3d seconds)      :%6.2f%%" % (options.max_wait, Server.jobs_timed_out * 100.00 / (Server.jobs_timed_out + Server.jobs_processed))
-    print "server time wasted                      :%6.2f%%" % (Server.server_time_wasted * 100.0 / Server.server_time_used)
-    print "mean time in system (seconds)           : %.2f" % Server.time_in_system.mean()
-    print "total jobs processed                    : %d" % Server.jobs_processed
-    print "total jobs timed out (%3d seconds)      : %d" % (options.max_wait, Server.jobs_timed_out)
-    print "server cost                             : $%.2f" % Server.total_cost
-    print "jobs processed per $1 server cost       : %d" % (Server.jobs_processed / Server.total_cost)
+    print("percentage of requests served within 30s:%6.2f%%" % (count * 100.0 / (Server.jobs_timed_out + Server.jobs_processed)))
+    print("percentage timed out (%3d seconds)      :%6.2f%%" % (options.max_wait, Server.jobs_timed_out * 100.00 / (Server.jobs_timed_out + Server.jobs_processed)))
+    print("server time wasted                      :%6.2f%%" % (Server.server_time_wasted * 100.0 / Server.server_time_used))
+    print("mean time in system (seconds)           : %.2f" % Server.time_in_system.mean())
+    print("total jobs processed                    : %d" % Server.jobs_processed)
+    print("total jobs timed out (%3d seconds)      : %d" % (options.max_wait, Server.jobs_timed_out))
+    print("server cost                             : $%.2f" % Server.total_cost)
+    print("jobs processed per $1 server cost       : %d" % (Server.jobs_processed / Server.total_cost))
 
     if options.plot:
         plt = SimPlot()
