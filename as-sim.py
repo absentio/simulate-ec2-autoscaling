@@ -48,6 +48,9 @@ import math
 
 from SimPy.Simulation import Process, Monitor, initialize, hold, passivate, activate, reactivate, simulate, now
 from SimPy.SimPlot import SimPlot, Frame, TOP, BOTH, YES
+from SMPyBandits.Environment import MAB
+from SMPyBandits.Arms import *
+from SMPyBandits.Policies import *
 
 #
 # cost of the AWS CloudWatch service (needed for AutoScaling) in
@@ -209,7 +212,11 @@ class Server(Process):
         #
         servers = Server.idle + Server.busy
         if servers:
-            s = sorted([(x.cost_rounded_up() - x.cost(), x) for x in servers])[0][1]
+            k = [(x.cost_rounded_up() - x.cost(), x) for x in servers]
+            k.sort(key=lambda x: x[0])
+            #print(k)
+            s = k[0][1]
+            #print(s)
         else:
             raise Exception('no servers to terminate')
 
@@ -312,6 +319,7 @@ class Watcher(Process):
         self.lower_breach_scale_increment = lower_breach_scale_increment
         self.upper_threshold = upper_threshold
         self.upper_breach_scale_increment = upper_breach_scale_increment
+        self.mab = UCBalpha(nbArms=3, alpha=4)
 
     def execute(self):
         checks = 0
@@ -319,7 +327,6 @@ class Watcher(Process):
         sample_period = 6
         last_scaling_activity = -1e6
         old_arrivals = 0
-
         while True:
             #
             # update cpu utilization across all servers
