@@ -1,7 +1,7 @@
 simulate-ec2-autoscaling
 ========================
 
-SimPy-based Python discrete event simulation of AWS EC2 Autoscaling for a job queue
+SimPy-based Python discrete event simulation of AWS EC2 Autoscaling for a job queue. Updated to work with Python3
 
 	Usage: as-sim.py [options] service-distribution-pathname
 	
