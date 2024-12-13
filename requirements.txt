@@ -1,1 +1,3 @@
+#SMPyBandits @ git+https://github.com/SMPyBandits/SMPyBandits.git#egg=SMPyBandits[full]
 SimPy>=2.3,<3
+SMPyBandits

@@ -45,12 +45,12 @@ import itertools
 import random
 import sys
 import math
+import numpy as np
 
 from SimPy.Simulation import Process, Monitor, initialize, hold, passivate, activate, reactivate, simulate, now
 from SimPy.SimPlot import SimPlot, Frame, TOP, BOTH, YES
-from SMPyBandits.Environment import MAB
-from SMPyBandits.Arms import *
-from SMPyBandits.Policies import *
+from SMPyBandits.Policies import UCB, UCBalpha, SWUCB, Exp3PlusPlus
+
 
 #
 # cost of the AWS CloudWatch service (needed for AutoScaling) in
@@ -166,6 +166,7 @@ class Server(Process):
     time_in_system = Monitor('time in system')
     total_cost = 0.0
     total_capacity = Monitor('total capacity')
+    #current_total = 0.0
     counter = itertools.count()
 
     def __init__(self, max_wait, instance_type='m1.small', latency=0):
@@ -187,6 +188,16 @@ class Server(Process):
         termination costs."""
         for s in Server.busy + Server.idle:
             Server.total_cost += s.cost()
+
+    @staticmethod
+    def current_total():
+        """Sum up costs of currently running servers and add them to
+        running total. Do not round up like when computing
+        termination costs."""
+        current_total = 0
+        for s in Server.busy + Server.idle:
+            current_total += s.cost()
+        return current_total
 
     def cost(self):
         return ((now() - self.start_time) / 3600.0) * COST_MODEL[self.instance_type][0]
@@ -302,11 +313,12 @@ class Watcher(Process):
     cpu_utilization = Monitor('cpu utilization')
     arrivals_mon = Monitor('arrivals')
 
-    def __init__(self, max_wait, instance_type, latency, period, breach_duration, min_size, max_size, cooldown, lower_threshold, lower_breach_scale_increment, upper_threshold, upper_breach_scale_increment):
+    def __init__(self, max_wait, instance_type, latency, period, breach_duration, min_size, max_size, cooldown, lower_threshold, lower_breach_scale_increment, upper_threshold, upper_breach_scale_increment, initial_capacity):
         Process.__init__(self, 'Watcher')
         self.max_wait = max_wait
         self.instance_type = instance_type
         self.latency = latency
+        self.initial_capacity = initial_capacity
         #
         # aws autoscale settings
         #
@@ -314,39 +326,114 @@ class Watcher(Process):
         self.breach_duration = breach_duration
         self.min_size = min_size
         self.max_size = max_size
-        self.cooldown = cooldown
+        self.cooldown = cooldown 
         self.lower_threshold = lower_threshold
         self.lower_breach_scale_increment = lower_breach_scale_increment
         self.upper_threshold = upper_threshold
         self.upper_breach_scale_increment = upper_breach_scale_increment
-        self.mab = UCBalpha(nbArms=3, alpha=4)
+        self.mab = UCBalpha(nbArms=3, alpha=4, lower=0, amplitude=1)
+        #self.mab = SWUCB(nbArms=3, tau=200, alpha=4, lower = 0, amplitude = 1)
+        #self.mab = Exp3PlusPlus(nbArms=3, lower=0, amplitude=2)
 
     def execute(self):
+        self.mab.startGame()
         checks = 0
         measures = []
+        latencies = []
+        latency_constraint  = 40
+        idx = 0
         sample_period = 6
         last_scaling_activity = -1e6
         old_arrivals = 0
+        latency_job = 1e6
+        last_action = -1 
+        scale = False
+        beta = 0.5
+        utilization = 0
+        massimo = self.initial_capacity+self.upper_breach_scale_increment
+        minimo = self.initial_capacity+self.lower_breach_scale_increment
         while True:
+            reward = 0
             #
             # update cpu utilization across all servers
             #
             busy = len(Server.busy)
             both = busy + len(Server.idle)
             Watcher.cpu_utilization.observe(100.0 * float(BUSY_FACTOR * busy) / float(BUSY_FACTOR * busy + len(Server.idle)) if both else 0.0)
-
             #
             # do autoscaling checks every 60 seconds
             #
             checks += 1
             if checks % 10 == 0:
-                #
+                scale = (now() - last_scaling_activity > self.cooldown)
+                times = Server.time_in_system.yseries()
+                samp = len(times) - idx
+                if scale and samp>=10 and (Server.jobs_processed + Server.jobs_timed_out) > 10 and len(Server.time_in_system)>0:
                 # compute the cpu utilization metric over the desired period
                 #
-                samples = int(self.period / sample_period)
-                utilization = sum(Watcher.cpu_utilization.yseries()[-samples:]) / samples
-                measures.append(utilization)
-                if len(measures) >= (self.breach_duration // self.period):
+                    samples = int(self.period / sample_period)
+                    utilization = sum(Watcher.cpu_utilization.yseries()[-samples:]) / samples
+                    measures.append(utilization)
+                    #print(len(times))
+                    #input("Press Enter to continue.")
+                    print("samp", samp, "idx", idx)
+                    latency_job = sum(times[idx:]) / samp
+                    latencies.append(latency_job)
+                    idx = len(times)
+                    if latency_job <= latency_constraint:
+                        reward = beta + (1-beta)*(massimo - both)/(massimo-minimo)
+                        #reward = (max(latencies) - latency_job)/(latency_job - latency_constraint)
+                    else:
+                        reward = beta * (1 - (latency_job - latency_constraint)/(9*latency_constraint))
+                    #reward  = 1 + min(latency_constraint - latency_job , 0)/1000
+                    #if reward == 0:
+                    #    reward = (max - both / max - min)(both+self.lower_breach_scale_increment)
+                    #reward = reward / 1000 + 2
+                    self.mab.getReward(last_action, reward)
+                    print(f"Step {checks}, MAB  last_action: {last_action}, reward {reward}, Servers {both}, Jobs processed: {Server.jobs_processed}, Jobs timed out: {Server.jobs_timed_out}, latency {latency_job}, utilization {utilization}")
+                    action = self.mab.choice()
+                    """#print("Action", action)
+                    if action == 0:
+                        new_server_target = max(self.initial_capacity + self.upper_breach_scale_increment, 0)
+                        for _ in range(new_server_target - both):
+                            s = Server(self.max_wait, self.instance_type, self.latency)
+                            activate(s, s.execute())
+                    elif action == 1:
+                        new_server_target = max(self.initial_capacity + self.lower_breach_scale_increment, 1)
+                        if both > 1:
+                            for _ in range(both - new_server_target):
+                                Server.terminate()
+                            #Server.terminate()
+                        else:
+                            action = 2
+                    #if action == 2:
+                    #    sys.stdout.write('O')
+                    #    sys.stdout.flush() """
+                    if action == 0:
+                        new_server_target = self.initial_capacity
+                    if action == 1:
+                        new_server_target = self.initial_capacity + self.upper_breach_scale_increment
+                    if action == 2:
+                        new_server_target = self.initial_capacity + self.lower_breach_scale_increment
+                    if self.initial_capacity <= 1:
+                        new_server_target += 1
+                    if new_server_target > both:
+                        for _ in range(new_server_target - both):
+                            s = Server(self.max_wait, self.instance_type, self.latency)
+                            activate(s, s.execute())
+                    else:
+                        for _ in range(both - new_server_target):
+                            Server.terminate()
+
+                    last_scaling_activity = now()
+                    last_action = action
+
+                    #reward = 1 - Server.server_time_wasted / Server.server_time_used
+                    #latency_req = int(latency_job <= latency_constraint)
+                    #reward = beta*latency_req + latency_req*(1-beta)* (1 - both/10)
+                    #print(self.mab)
+
+                """                 if len(measures) >= (self.breach_duration // self.period):
                     if len(measures) > (self.breach_duration // self.period):
                         measures.pop(0)
                     if now() - last_scaling_activity > self.cooldown:
@@ -367,10 +454,12 @@ class Watcher(Process):
                             for _ in range(new_server_target - both):
                                 s = Server(self.max_wait, self.instance_type, self.latency)
                                 activate(s, s.execute())
-                            last_scaling_activity = now()
+                            last_scaling_activity = now() """
+
                 #
                 # unrelated: also keep track of arrival rate
                 #
+                
                 Watcher.arrivals_mon.observe(Job.arrivals - old_arrivals)
                 old_arrivals = Job.arrivals
 
@@ -387,9 +476,9 @@ if __name__ == '__main__':
     parser.add_option('', '--trace', dest='trace', action='store_true', help='Trace simulation activity (very detailed)')
     parser.add_option('', '--plot', dest='plot', action='store_true', help='Plot capacity and load vs. time')
     parser.add_option('', '--duration', dest='duration', action='store', type='float', default=24*60*60, help='Duration of simulation (in seconds) (default: %(default))')
-    parser.add_option('', '--max_wait', dest='max_wait', action='store', type='float', default=180, help='Maximum wait for completed service (in seconds) (default: %(default))')
+    parser.add_option('', '--max_wait', dest='max_wait', action='store', type='float', default=24*60, help='Maximum wait for completed service (in seconds) (default: %(default))')
     parser.add_option('', '--instance_type', dest='instance_type', action='store', type='choice', choices=list(COST_MODEL.keys()), default='m1.small', help='EC2 instance type [default: %(default)]')
-    parser.add_option('', '--latency', dest='latency', action='store', type='float', default=90, help='Time it takes for new servers to spin up (in seconds) (default: %(default))')
+    parser.add_option('', '--latency', dest='latency', action='store', type='float', default=0, help='Time it takes for new servers to spin up (in seconds) (default: %(default))')
     parser.add_option('', '--rate', dest='rate', action='store', type='float', default=0.25, help='Arrival rate of jobs per second (default: %(default))')
 
     si_help = \
@@ -516,20 +605,20 @@ if __name__ == '__main__':
                 options.as_period,
                 options.as_breach_duration,
                 options.as_min_size,
-                options.as_max_size,
+                options.as_max_size,  
                 options.as_cooldown,
                 options.as_lower_threshold,
                 options.as_lower_breach_scale_increment,
                 options.as_upper_threshold,
-                options.as_upper_breach_scale_increment)
+                options.as_upper_breach_scale_increment, options.capacity)
     activate(w, w.execute())
 
     simulate(until=options.duration)
     Server.total()
     Server.total_capacity.observe(len(Server.busy) + len(Server.idle))
-
-    print("server utilization                      :%6.2f%%" % Watcher.cpu_utilization.timeAverage())
+    print("\nserver utilization                      :%6.2f%%" % Watcher.cpu_utilization.timeAverage())
     count = 0
+    #print(Server.time_in_system.y)
     for i, y in zip(itertools.count(), sorted(Server.time_in_system.yseries())):
         count = i + 1
         if y > 30.0:
@@ -542,6 +631,7 @@ if __name__ == '__main__':
     print("total jobs timed out (%3d seconds)      : %d" % (options.max_wait, Server.jobs_timed_out))
     print("server cost                             : $%.2f" % Server.total_cost)
     print("jobs processed per $1 server cost       : %d" % (Server.jobs_processed / Server.total_cost))
+    print("Server in the end", Server.total_capacity.yseries()[-1])
 
     if options.plot:
         plt = SimPlot()
