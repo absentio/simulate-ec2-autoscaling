@@ -48,9 +48,9 @@ import math
 import numpy as np
 
 from SimPy.Simulation import Process, Monitor, initialize, hold, passivate, activate, reactivate, simulate, now
-from SimPy.SimPlot import SimPlot, Frame, TOP, BOTH, YES
+#from SimPy.SimPlot import SimPlot, Frame, TOP, BOTH, YES
 from SMPyBandits.Policies import UCB, UCBalpha, SWUCB, Exp3PlusPlus
-
+from pyparsing import oneOf
 
 #
 # cost of the AWS CloudWatch service (needed for AutoScaling) in
@@ -313,12 +313,14 @@ class Watcher(Process):
     cpu_utilization = Monitor('cpu utilization')
     arrivals_mon = Monitor('arrivals')
 
-    def __init__(self, max_wait, instance_type, latency, period, breach_duration, min_size, max_size, cooldown, lower_threshold, lower_breach_scale_increment, upper_threshold, upper_breach_scale_increment, initial_capacity):
+    def __init__(self, max_wait, instance_type, latency, period, breach_duration, min_size, max_size, cooldown, lower_threshold, lower_breach_scale_increment, upper_threshold, upper_breach_scale_increment, initial_capacity, alg, arms):
         Process.__init__(self, 'Watcher')
         self.max_wait = max_wait
         self.instance_type = instance_type
         self.latency = latency
+        self.alg = alg
         self.initial_capacity = initial_capacity
+        print(type(arms))
         #
         # aws autoscale settings
         #
@@ -331,9 +333,19 @@ class Watcher(Process):
         self.lower_breach_scale_increment = lower_breach_scale_increment
         self.upper_threshold = upper_threshold
         self.upper_breach_scale_increment = upper_breach_scale_increment
-        self.mab = UCBalpha(nbArms=3, alpha=4, lower=0, amplitude=1)
-        #self.mab = SWUCB(nbArms=3, tau=200, alpha=4, lower = 0, amplitude = 1)
-        #self.mab = Exp3PlusPlus(nbArms=3, lower=0, amplitude=2)
+        if not isinstance(arms, list) or len(arms) == 0 :
+            self.arms = [initial_capacity, initial_capacity + self.upper_breach_scale_increment, initial_capacity +self.lower_breach_scale_increment]
+        else:
+            self.arms = arms
+        self.arms.sort()
+        self.n_arms = len(self.arms)
+        self.mab = UCBalpha(nbArms=self.n_arms, alpha=4, lower=0, amplitude=1)
+        if self.alg == "exp3":
+            self.mab = Exp3PlusPlus(nbArms=self.n_arms, lower=0, amplitude=1)
+        elif self.alg == "swucb":
+            self.mab = SWUCB(nbArms=self.n_arms, tau=50, alpha=4, lower = 0, amplitude = 1)
+        self.massimo = max(self.arms)
+        self.minimo = min(self.arms)
 
     def execute(self):
         self.mab.startGame()
@@ -348,10 +360,10 @@ class Watcher(Process):
         latency_job = 1e6
         last_action = -1 
         scale = False
-        beta = 0.5
+        beta = 0.75
+        new_server_target = self.initial_capacity
+        cstr = 10
         utilization = 0
-        massimo = self.initial_capacity+self.upper_breach_scale_increment
-        minimo = self.initial_capacity+self.lower_breach_scale_increment
         while True:
             reward = 0
             #
@@ -381,16 +393,23 @@ class Watcher(Process):
                     latencies.append(latency_job)
                     idx = len(times)
                     if latency_job <= latency_constraint:
-                        reward = beta + (1-beta)*(massimo - both)/(massimo-minimo)
+                        reward = beta*1 + (1-beta)*(self.massimo - both)/(self.massimo-self.minimo)
                         #reward = (max(latencies) - latency_job)/(latency_job - latency_constraint)
                     else:
-                        reward = beta * (1 - (latency_job - latency_constraint)/(9*latency_constraint))
+                        l_factor = -(latency_constraint - latency_job) / (cstr * latency_constraint)
+                        print(f"l_factor {l_factor}, cstr {cstr}")
+                        if l_factor < 0.1:
+                            cstr = max(cstr - 1, 1)
+                        if l_factor > 1:
+                            l_factor = 1
+                            cstr = cstr + 1
+                        reward =  beta * min(1, 1 - l_factor)
                     #reward  = 1 + min(latency_constraint - latency_job , 0)/1000
                     #if reward == 0:
                     #    reward = (max - both / max - min)(both+self.lower_breach_scale_increment)
                     #reward = reward / 1000 + 2
                     self.mab.getReward(last_action, reward)
-                    print(f"Step {checks}, MAB  last_action: {last_action}, reward {reward}, Servers {both}, Jobs processed: {Server.jobs_processed}, Jobs timed out: {Server.jobs_timed_out}, latency {latency_job}, utilization {utilization}")
+                    print(f"Step {checks}, MAB {self.alg} round {self.mab.t} rewards {self.mab.rewards}  last_action: {last_action}, reward {reward}, Servers {both}, Jobs processed: {Server.jobs_processed}, Jobs timed out: {Server.jobs_timed_out}, latency {latency_job}, utilization {utilization}")
                     action = self.mab.choice()
                     """#print("Action", action)
                     if action == 0:
@@ -409,14 +428,15 @@ class Watcher(Process):
                     #if action == 2:
                     #    sys.stdout.write('O')
                     #    sys.stdout.flush() """
-                    if action == 0:
+                    '''if action == 0:
                         new_server_target = self.initial_capacity
                     if action == 1:
                         new_server_target = self.initial_capacity + self.upper_breach_scale_increment
                     if action == 2:
                         new_server_target = self.initial_capacity + self.lower_breach_scale_increment
                     if self.initial_capacity <= 1:
-                        new_server_target += 1
+                        new_server_target += 1'''
+                    new_server_target = self.arms[action]
                     if new_server_target > both:
                         for _ in range(new_server_target - both):
                             s = Server(self.max_wait, self.instance_type, self.latency)
@@ -473,13 +493,17 @@ if __name__ == '__main__':
     parser = optparse.OptionParser(__doc__)
     parser.add_option('', '--seed', dest='seed', action='store', type='int', default=0, help='PRNG seed (default: %(default) means use an OS source)')
     parser.add_option('', '--capacity', dest='capacity', action='store', type='int', default=1, help='Set initial number of servers (default: %(default))')
+    parser.add_option('', '--alg', dest='alg', action='store', type='choice', choices = ["ucb", "swucb","exp3"], default="ucb",
+                      help='Set the MAB algorithm (default: %(default))')
+    parser.add_option('', '--arms', dest='arms', action='store', type='str',  default="",
+                      help='Set the list of admitted running instances values (default: %(default))')
     parser.add_option('', '--trace', dest='trace', action='store_true', help='Trace simulation activity (very detailed)')
     parser.add_option('', '--plot', dest='plot', action='store_true', help='Plot capacity and load vs. time')
     parser.add_option('', '--duration', dest='duration', action='store', type='float', default=24*60*60, help='Duration of simulation (in seconds) (default: %(default))')
     parser.add_option('', '--max_wait', dest='max_wait', action='store', type='float', default=24*60, help='Maximum wait for completed service (in seconds) (default: %(default))')
     parser.add_option('', '--instance_type', dest='instance_type', action='store', type='choice', choices=list(COST_MODEL.keys()), default='m1.small', help='EC2 instance type [default: %(default)]')
     parser.add_option('', '--latency', dest='latency', action='store', type='float', default=0, help='Time it takes for new servers to spin up (in seconds) (default: %(default))')
-    parser.add_option('', '--rate', dest='rate', action='store', type='float', default=0.25, help='Arrival rate of jobs per second (default: %(default))')
+    parser.add_option('', '--rate', dest='rate', action='store', type='float', default=0.2, help='Arrival rate of jobs per second (default: %(default))')
 
     si_help = \
 '''You can modify the base rate of job arrivals as a function of
@@ -529,7 +553,7 @@ if __name__ == '__main__':
     as_group.add_option('', '--as_breach_duration', dest='as_breach_duration', action='store', type='int', default=240, help='The amount of time in seconds used to evaluate and determine if a breach is occurring (default: %default)')
     as_group.add_option('', '--as_min_size', dest='as_min_size', action='store', type='int', default=1, help='Minimum size of group (default: %default)')
     as_group.add_option('', '--as_max_size', dest='as_max_size', action='store', type='int', default=50, help='Maximum size of the group (default: %default)')
-    as_group.add_option('', '--as_cooldown', dest='as_cooldown', action='store', type='int', default=240, help='The amount of time after a scaling activity completes before any further trigger-related scaling activities can start (default: %default)')
+    as_group.add_option('', '--as_cooldown', dest='as_cooldown', action='store', type='int', default=300, help='The amount of time after a scaling activity completes before any further trigger-related scaling activities can start (default: %default)')
     as_group.add_option('', '--as_lower_threshold', dest='as_lower_threshold', action='store', type='int', default=70, help='The lower limit for the metric (default: %default)')
     as_group.add_option('', '--as_lower_breach_scale_increment', dest='as_lower_breach_scale_increment', action='store', type='int', default=-1, help='The incremental amount to use when performing scaling activities when the lower threshold has been breached (default: %default)')
     as_group.add_option('', '--as_upper_threshold', dest='as_upper_threshold', action='store', type='int', default=95, help='The upper limit for the metric (default: %default)')
@@ -583,6 +607,7 @@ if __name__ == '__main__':
     else:
         random.seed()
 
+    options.arms = [int(item) for item in options.arms.split(',')]
     initialize()
 
     #
@@ -610,7 +635,7 @@ if __name__ == '__main__':
                 options.as_lower_threshold,
                 options.as_lower_breach_scale_increment,
                 options.as_upper_threshold,
-                options.as_upper_breach_scale_increment, options.capacity)
+                options.as_upper_breach_scale_increment, options.capacity, options.alg, options.arms)
     activate(w, w.execute())
 
     simulate(until=options.duration)
@@ -633,7 +658,7 @@ if __name__ == '__main__':
     print("jobs processed per $1 server cost       : %d" % (Server.jobs_processed / Server.total_cost))
     print("Server in the end", Server.total_capacity.yseries()[-1])
 
-    if options.plot:
+    '''if options.plot:
         plt = SimPlot()
         plt.root.title('Simulation Output')
         step = plt.makeStep(Server.total_capacity, color='blue')
@@ -648,4 +673,4 @@ if __name__ == '__main__':
         graph2.pack(side=TOP, fill=BOTH, expand=YES)
         graph2.draw(obj2, xaxis=(0, options.duration))
         frame.pack()
-        plt.mainloop()
+        plt.mainloop()'''
